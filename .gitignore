@@ -1,0 +1,16 @@
+.venv/
+DATA/
+model_artifacts/
+river_patches/
+river_patches_with_indices/
+VIS/
+__pycache__/
+availability_check/
+*.pt
+*.pkl
+*.pth
+*.pt.tar.gz
+*.pkl.tar.gz
+*.pth.tar.gz
+*.tar.gz
+*.zip
