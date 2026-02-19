@@ -6,6 +6,7 @@ river_patches_with_indices/
 VIS/
 __pycache__/
 availability_check/
+data/
 *.pt
 *.pkl
 *.pth

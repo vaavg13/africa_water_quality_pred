@@ -6,6 +6,10 @@ matplotlib
 seaborn
 folium
 scipy
-# torch
-# torchvision
+torch
+torchvision
 scikit-learn
+tqdm
+pyogrio
+pyarrow
+shapely

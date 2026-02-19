@@ -6,20 +6,22 @@ import time
 import urllib.request
 import concurrent.futures as cf
 import json
+import argparse
 
 # ---------------------------
 # Parameters
 # ---------------------------
 
-CSV_PATH = "DATA/water_quality_training_dataset.csv"
-START_INDEX = 6000  # Set e.g. 600 to process rows 600..(600+NUM_SAMPLES-1)
-NUM_SAMPLES = 2000
+CSV_PATH = "water_quality_training_dataset.csv"
+START_INDEX = 0  # Set e.g. 600 to process rows 600..(600+NUM_SAMPLES-1)
+NUM_SAMPLES = None  # None = process all rows
 PATCH_SIZE = 256
 SCALE = 30
 HALF_SIZE_METERS = (PATCH_SIZE * SCALE) / 2
 
-MAX_CLOUD_COVER = 80
-MAX_DAYS_SEARCH = 730
+MAX_CLOUD_COVER = 100  # Accept any cloud cover
+# Expand search window significantly to find any available imagery
+MAX_DAYS_SEARCH = 2000  # Search up to 2 years before/after for difficult locations
 
 METADATA_BATCH_SIZE = 100  # Smaller metadata batches reduce memory spikes on long runs
 
@@ -42,8 +44,9 @@ else:
 LANDSAT_5 = "LANDSAT/LT05/C02/T1_L2"
 LANDSAT_8 = "LANDSAT/LC08/C02/T1_L2"
 
-BANDS_L5 = ["SR_B3", "SR_B4", "SR_B5", "SR_B7"]
-BANDS_L89 = ["SR_B4", "SR_B5", "SR_B6", "SR_B7"]
+# Green needed for MNDWI; order: Green, Red, NIR, SWIR1, SWIR2
+BANDS_L5 = ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B7"]
+BANDS_L89 = ["SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"]
 
 OUTPUT_FOLDER = "river_patches"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -82,35 +85,46 @@ def mask_scale_landsat_89(image):
     )
 
 def find_closest_image_optimized(lat, lon, target_date, region, max_days=None):
-    """Find the closest available Landsat image - optimized version."""
+    """Find the nearest-date Landsat image, cloud as tie-breaker. Uses progressive relaxation if no match."""
     if max_days is None:
         max_days = MAX_DAYS_SEARCH
     
     target = ee.Date(target_date)
-    year = target.get('year')
+    start = target.advance(-max_days, 'day')
+    end = target.advance(max_days, 'day')
+    ls8_start = ee.Date('2013-03-18')
     
+    # No cloud cover filtering - accept any imagery
     landsat_5_coll = (
         ee.ImageCollection(LANDSAT_5)
         .filterBounds(region)
-        .filterDate(target.advance(-max_days, 'day'), target.advance(max_days, 'day'))
-        .filter(ee.Filter.lt("CLOUD_COVER", MAX_CLOUD_COVER))
+        .filterDate(start, end)
         .map(mask_scale_landsat_5)
     )
     
     landsat_8_coll = (
         ee.ImageCollection(LANDSAT_8)
         .filterBounds(region)
-        .filterDate(target.advance(-max_days, 'day'), target.advance(max_days, 'day'))
-        .filter(ee.Filter.lt("CLOUD_COVER", MAX_CLOUD_COVER))
+        .filterDate(start, end)
         .map(mask_scale_landsat_89)
     )
     
+    # Avoid querying L8 when the sampling date predates L8 availability.
+    # This reduces unnecessary search load for 2011-early 2013 samples.
     collection = ee.ImageCollection(
-        ee.Algorithms.If(year.lt(2013), landsat_5_coll, landsat_8_coll)
+        ee.Algorithms.If(target.millis().lt(ls8_start.millis()), landsat_5_coll, landsat_5_coll.merge(landsat_8_coll))
+    )
+    collection = collection.map(
+        lambda img: img.set({
+            'days_diff': ee.Number(img.date().difference(target, 'day')).abs(),
+            # Days difference dominates ranking, cloud is tie-breaker.
+            'rank_score': ee.Number(img.date().difference(target, 'day')).abs().multiply(1000)
+                .add(ee.Number(img.get('CLOUD_COVER')))
+        })
     )
     
     has_images = collection.size().gt(0)
-    sorted_coll = collection.sort("CLOUD_COVER")
+    sorted_coll = collection.sort("rank_score")
     
     # Create dummy image with required properties set
     dummy_image = ee.Image.constant(0).set({
@@ -155,14 +169,10 @@ def find_closest_image_optimized(lat, lon, target_date, region, max_days=None):
         'days_diff': days_diff,
         'cloud_cover': cloud_cover,
         'satellite': satellite_id,
-        'year': year
+        'max_days_search': max_days
     })
-    
-    bands_list = ee.List(
-        ee.Algorithms.If(year.lt(2013), BANDS_L5, BANDS_L89)
-    )
-    
-    return best_image, metadata_dict, bands_list
+
+    return best_image, metadata_dict
 
 
 def load_existing_metadata():
@@ -188,12 +198,35 @@ def save_metadata(metadata_records):
 # Main Pipeline
 # ---------------------------
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Download Landsat patches for water quality locations")
+    parser.add_argument("--csv", type=str, default=None, help="Path to CSV file with locations (default: water_quality_training_dataset.csv)")
+    parser.add_argument("--start", type=int, default=0, help="Start index (default: 0)")
+    parser.add_argument("--num", type=int, default=None, help="Number of samples to process (default: all)")
+    parser.add_argument("--output", type=str, default="river_patches", help="Output folder (default: river_patches)")
+    args = parser.parse_args()
+    
+    if args.csv:
+        CSV_PATH = args.csv
+    if args.start:
+        START_INDEX = args.start
+    if args.num:
+        NUM_SAMPLES = args.num
+    if args.output:
+        OUTPUT_FOLDER = args.output
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+        METADATA_JSON = os.path.join(OUTPUT_FOLDER, "metadata.json")
+        METADATA_CSV = os.path.join(OUTPUT_FOLDER, "metadata.csv")
+
 print("="*80)
 print("🚀 BATCHED LANDSAT PATCH EXTRACTION PIPELINE")
 print("="*80)
 
 df = pd.read_csv(CSV_PATH)
-end_index = min(START_INDEX + NUM_SAMPLES, len(df))
+if NUM_SAMPLES is None:
+    end_index = len(df)
+else:
+    end_index = min(START_INDEX + NUM_SAMPLES, len(df))
 df_subset = df.iloc[START_INDEX:end_index]
 
 print(f"\nProcessing {len(df_subset)} samples...")
@@ -227,7 +260,7 @@ for batch_num in range(num_batches):
         target_date = date.strftime("%Y-%m-%d")
         region = get_patch_geometry(lat, lon)
         
-        image, metadata_dict, bands_list = find_closest_image_optimized(
+        image, metadata_dict = find_closest_image_optimized(
             lat, lon, target_date, region
         )
         
@@ -239,8 +272,7 @@ for batch_num in range(num_batches):
             'target_date': target_date,
             'region': region,
             'image': image,
-            'metadata': metadata_dict,
-            'bands_list': bands_list
+            'metadata': metadata_dict
         })
         
         batch_metadata_dict[f'sample_{idx}'] = metadata_dict
@@ -255,15 +287,15 @@ for batch_num in range(num_batches):
         total_processed += 1
         
         if not meta['has_images']:
-            if idx % 50 == 0 or total_processed <= 10:
-                print(f"     [{idx}] ❌ No usable image found")
+            search_days = meta.get('max_days_search', MAX_DAYS_SEARCH)
+            print(f"     [{idx}] ❌ No image found (lat={sample['lat']:.4f}, lon={sample['lon']:.4f}, date={sample['target_date']}, search_window=±{search_days}d)")
             continue
         
         batch_found += 1
         total_found += 1
         
-        year = meta['year']
-        bands = BANDS_L5 if year < 2013 else BANDS_L89
+        satellite = str(meta.get('satellite', '')).upper()
+        bands = BANDS_L5 if "LANDSAT_5" in satellite else BANDS_L89
         # Export SR bands only; force float32 consistency across all bands.
         patch = sample['image'].select(bands).toFloat().clip(sample['region'])
         
@@ -275,6 +307,7 @@ for batch_num in range(num_batches):
             'actual_date': meta['date'],
             'days_diff': meta['days_diff'],
             'cloud_cover': meta['cloud_cover'],
+            'satellite': meta.get('satellite', 'UNKNOWN'),
             'region': sample['region'],
             'patch': patch
         })
@@ -376,8 +409,8 @@ for sample in samples_to_process:
     status = "downloaded" if result["ok"] and result["message"] != "exists" else (
         "exists" if result["ok"] else "failed"
     )
-    year = datetime.strptime(sample["actual_date"], "%Y-%m-%d").year
-    bands = BANDS_L5 if year < 2013 else BANDS_L89
+    satellite = str(sample.get("satellite", "")).upper()
+    bands = BANDS_L5 if "LANDSAT_5" in satellite else BANDS_L89
 
     existing_by_id[idx] = {
         "patch_id": idx,
@@ -390,8 +423,9 @@ for sample in samples_to_process:
         "actual_date": sample["actual_date"],
         "days_difference": float(sample["days_diff"]),
         "cloud_cover": float(sample["cloud_cover"]),
+        "satellite": sample.get("satellite", "UNKNOWN"),
         "bands": bands,  # SR band names in source collection
-        "derived_local": ["NDVI", "NDMI", "water_mask"],
+        "derived_local": ["NDVI", "NDMI", "water_mask", "MNDWI"],
         "download_status": status,
         "download_message": result["message"],
     }

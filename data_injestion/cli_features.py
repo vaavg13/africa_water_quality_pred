@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 import argparse
 
+ee.Authenticate()
 ee.Initialize(project='gearth-486818')
 
 # ---------------------------
