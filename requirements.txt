@@ -13,3 +13,8 @@ tqdm
 pyogrio
 pyarrow
 shapely
+cdsapi
+catboost
+tabpfn
+tabm
+pytorch-tabnet
